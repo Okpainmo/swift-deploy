@@ -1,0 +1,344 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parent
+MANIFEST = ROOT / "manifest.yaml"
+NGINX_CONF = ROOT / "nginx.conf"
+COMPOSE_FILE = ROOT / "docker-compose.yml"
+TEMPLATES = ROOT / "templates"
+GENERATED = [NGINX_CONF, COMPOSE_FILE]
+
+REQUIRED_FIELDS = (
+    ("services", "image"),
+    ("services", "port"),
+    ("nginx", "image"),
+    ("nginx", "port"),
+    ("network", "name"),
+    ("network", "driver_type"),
+)
+
+
+class SwiftDeployError(Exception):
+    pass
+
+
+def parse_scalar(value):
+    value = value.strip()
+    if not value:
+        return ""
+    if (value.startswith('"') and value.endswith('"')) or (
+        value.startswith("'") and value.endswith("'")
+    ):
+        return value[1:-1]
+    if value.lower() in {"true", "false"}:
+        return value.lower() == "true"
+    try:
+        return int(value)
+    except ValueError:
+        return value
+
+
+def load_manifest():
+    if not MANIFEST.exists():
+        raise SwiftDeployError("manifest.yaml does not exist")
+
+    data = {}
+    current_section = None
+    try:
+        for line_number, raw in enumerate(MANIFEST.read_text().splitlines(), start=1):
+            line = raw.split("#", 1)[0].rstrip()
+            if not line:
+                continue
+            indent = len(line) - len(line.lstrip(" "))
+            stripped = line.strip()
+            if ":" not in stripped:
+                raise SwiftDeployError(f"invalid YAML near line {line_number}")
+            key, value = stripped.split(":", 1)
+            key = key.strip()
+            value = value.strip()
+            if indent == 0:
+                if value:
+                    data[key] = parse_scalar(value)
+                    current_section = None
+                else:
+                    data[key] = {}
+                    current_section = key
+            elif indent == 2 and current_section:
+                if not isinstance(data.get(current_section), dict):
+                    raise SwiftDeployError(f"invalid mapping near line {line_number}")
+                data[current_section][key] = parse_scalar(value)
+            else:
+                raise SwiftDeployError(f"unsupported indentation near line {line_number}")
+    except UnicodeDecodeError as exc:
+        raise SwiftDeployError("manifest.yaml is not valid text") from exc
+
+    if not isinstance(data, dict) or not data:
+        raise SwiftDeployError("manifest.yaml is empty or invalid")
+    return data
+
+
+def quote_yaml(value):
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    text = str(value)
+    if text == "" or any(char in text for char in ":#{}[]&,") or text.lower() in {"true", "false"}:
+        return json.dumps(text)
+    return text
+
+
+def write_manifest(data):
+    order = ("services", "nginx", "network")
+    lines = []
+    for section in order:
+        values = data.get(section, {})
+        lines.append(f"{section}:")
+        for key, value in values.items():
+            lines.append(f"  {key}: {quote_yaml(value)}")
+        lines.append("")
+    MANIFEST.write_text("\n".join(lines).rstrip() + "\n")
+
+
+def require_fields(data):
+    missing = []
+    for section, key in REQUIRED_FIELDS:
+        value = data.get(section, {}).get(key)
+        if value is None or value == "":
+            missing.append(f"{section}.{key}")
+    if missing:
+        raise SwiftDeployError("missing required fields: " + ", ".join(missing))
+
+
+def manifest_context(data):
+    require_fields(data)
+    service = data["services"]
+    nginx = data["nginx"]
+    network = data["network"]
+    return {
+        "service_image": str(service["image"]),
+        "service_port": str(service["port"]),
+        "service_mode": str(service.get("mode", "stable")),
+        "app_version": str(service.get("version", "1.0.0")),
+        "restart_policy": str(service.get("restart_policy", "unless-stopped")),
+        "nginx_image": str(nginx["image"]),
+        "nginx_port": str(nginx["port"]),
+        "proxy_timeout": str(nginx.get("proxy_timeout", "5s")),
+        "contact": str(nginx.get("contact", "ops@swiftdeploy.local")),
+        "network_name": str(network["name"]),
+        "network_driver": str(network["driver_type"]),
+    }
+
+
+def render_template(name, context):
+    text = (TEMPLATES / name).read_text()
+    for key, value in context.items():
+        text = text.replace("${" + key + "}", value)
+    return text
+
+
+def init(_args):
+    data = load_manifest()
+    context = manifest_context(data)
+    NGINX_CONF.write_text(render_template("nginx.conf.tpl", context))
+    COMPOSE_FILE.write_text(render_template("docker-compose.yml.tpl", context))
+    print(f"generated {NGINX_CONF.name}")
+    print(f"generated {COMPOSE_FILE.name}")
+
+
+def run(command, *, check=True, capture=True):
+    result = subprocess.run(
+        command,
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE if capture else None,
+        stderr=subprocess.STDOUT if capture else None,
+        check=False,
+    )
+    if check and result.returncode != 0:
+        output = (result.stdout or "").strip()
+        raise SwiftDeployError(f"{' '.join(command)} failed" + (f":\n{output}" if output else ""))
+    return result
+
+
+def check_port_free(port):
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(("0.0.0.0", int(port)))
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def image_exists(image):
+    return run(["docker", "image", "inspect", image], check=False).returncode == 0
+
+
+def nginx_config_valid(nginx_image):
+    if not NGINX_CONF.exists():
+        raise SwiftDeployError("nginx.conf has not been generated; run ./swiftdeploy init")
+    command = [
+        "docker",
+        "run",
+        "--rm",
+        "--add-host",
+        "swiftdeploy-app:127.0.0.1",
+        "-v",
+        f"{NGINX_CONF}:/etc/nginx/nginx.conf:ro",
+        nginx_image,
+        "nginx",
+        "-t",
+    ]
+    return run(command, check=False).returncode == 0
+
+
+def report(name, passed, detail):
+    status = "PASS" if passed else "FAIL"
+    print(f"[{status}] {name}: {detail}")
+
+
+def validate(_args):
+    failures = 0
+    data = None
+
+    try:
+        data = load_manifest()
+        report("manifest YAML", True, "manifest.yaml exists and parsed")
+    except SwiftDeployError as exc:
+        report("manifest YAML", False, str(exc))
+        return 1
+
+    try:
+        require_fields(data)
+        report("required fields", True, "all required fields are present and non-empty")
+    except SwiftDeployError as exc:
+        failures += 1
+        report("required fields", False, str(exc))
+
+    context = manifest_context(data) if failures == 0 else {}
+
+    if context and image_exists(context["service_image"]):
+        report("service image", True, f"{context['service_image']} exists locally")
+    else:
+        failures += 1
+        report("service image", False, f"{data.get('services', {}).get('image')} is not a local Docker image")
+
+    nginx_port = data.get("nginx", {}).get("port")
+    if nginx_port and check_port_free(nginx_port):
+        report("nginx port", True, f"host port {nginx_port} is available")
+    else:
+        failures += 1
+        report("nginx port", False, f"host port {nginx_port} is already bound")
+
+    nginx_image = data.get("nginx", {}).get("image", "nginx:latest")
+    if nginx_config_valid(str(nginx_image)):
+        report("nginx syntax", True, "generated nginx.conf passed nginx -t")
+    else:
+        failures += 1
+        report("nginx syntax", False, "generated nginx.conf failed nginx -t")
+
+    return 1 if failures else 0
+
+
+def health_url(data):
+    return f"http://127.0.0.1:{data['nginx']['port']}/healthz"
+
+
+def wait_for_health(data, expected_mode=None, timeout=60):
+    deadline = time.time() + timeout
+    url = health_url(data)
+    last_error = None
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(url, timeout=3) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+                mode_ok = expected_mode is None or payload.get("mode") == expected_mode
+                if response.status == 200 and payload.get("status") == "ok" and mode_ok:
+                    return payload
+                last_error = f"unexpected health payload: {payload}"
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+            last_error = str(exc)
+        time.sleep(2)
+    raise SwiftDeployError(f"health check did not pass within {timeout}s: {last_error}")
+
+
+def deploy(args):
+    init(args)
+    run(["docker", "compose", "up", "-d"], capture=False)
+    data = load_manifest()
+    payload = wait_for_health(data, timeout=60)
+    print(f"deployment healthy: {json.dumps(payload, separators=(',', ':'))}")
+
+
+def promote(args):
+    target = args.mode
+    data = load_manifest()
+    current = str(data.get("services", {}).get("mode", "stable"))
+    if current == target:
+        print(f"service already in {target} mode")
+    data.setdefault("services", {})["mode"] = target
+    write_manifest(data)
+    init(args)
+    run(["docker", "compose", "up", "-d", "--no-deps", "--force-recreate", "app"], capture=False)
+    payload = wait_for_health(data, expected_mode=target, timeout=60)
+    print(f"promoted to {target}: {json.dumps(payload, separators=(',', ':'))}")
+
+
+def teardown(args):
+    command = ["docker", "compose", "down", "--volumes", "--remove-orphans"]
+    run(command, capture=False)
+    if args.clean:
+        for path in GENERATED:
+            if path.exists():
+                path.unlink()
+                print(f"deleted {path.name}")
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(prog="swiftdeploy")
+    subcommands = parser.add_subparsers(dest="command", required=True)
+
+    init_parser = subcommands.add_parser("init", help="generate nginx.conf and docker-compose.yml")
+    init_parser.set_defaults(func=init)
+
+    validate_parser = subcommands.add_parser("validate", help="run pre-flight checks")
+    validate_parser.set_defaults(func=validate)
+
+    deploy_parser = subcommands.add_parser("deploy", help="generate config and start the stack")
+    deploy_parser.set_defaults(func=deploy)
+
+    promote_parser = subcommands.add_parser("promote", help="switch between stable and canary")
+    promote_parser.add_argument("mode", choices=("canary", "stable"))
+    promote_parser.set_defaults(func=promote)
+
+    teardown_parser = subcommands.add_parser("teardown", help="remove stack resources")
+    teardown_parser.add_argument("--clean", action="store_true", help="delete generated configs")
+    teardown_parser.set_defaults(func=teardown)
+
+    return parser
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+    try:
+        result = args.func(args)
+    except SwiftDeployError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    return int(result or 0)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
