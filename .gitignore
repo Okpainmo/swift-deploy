@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Python env
+.venv/
+venv/
+env/
+
+# Environment variables
+.env*
+!.env*.sample
