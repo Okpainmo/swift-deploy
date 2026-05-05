@@ -2,8 +2,7 @@
 
 > A lightweight, declarative infrastructure tool that turns a single manifest.yaml into a fully running containerized stack.
 
-`swiftdeploy` is a small declarative deployment tool. You describe the stack once in
-`manifest.yaml`, then on running the respective CLI commands, it(the CLI) is able to generate `nginx.conf` and `docker-compose.yml`, start the respective containers, switch release modes, and also tear the stack down.
+`swiftdeploy` is a small declarative deployment tool. You describe the stack once in `manifest.yaml`, then on running the respective CLI commands, it(the CLI) is able to generate `nginx.conf` and `docker-compose.yml` from provided customizable templates, start the respective containers, switch release modes, and also tear the stack down - respectively.
 
 The manifest is the source of truth. Generated files can be deleted and recreated with:
 
