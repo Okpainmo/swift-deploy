@@ -1,0 +1,16 @@
+services:
+  image: "sd-demo-api-1:latest"
+  port: 5000
+  mode: stable
+  version: 1.0.0
+  restart_policy: unless-stopped
+
+nginx:
+  image: "nginx:latest"
+  port: 8080
+  proxy_timeout: 5s
+  contact: ops@swiftdeploy.local
+
+network:
+  name: swiftdeploy-net
+  driver_type: bridge
