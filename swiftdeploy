@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 import argparse
+from datetime import datetime, timezone
 import json
 import os
+import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -15,6 +18,9 @@ ROOT = Path(__file__).resolve().parent
 MANIFEST = ROOT / "manifest.yaml"
 NGINX_CONF = ROOT / "nginx.conf"
 COMPOSE_FILE = ROOT / "docker-compose.yml"
+POLICIES_DIR = ROOT / "policies"
+HISTORY_FILE = ROOT / "history.jsonl"
+AUDIT_REPORT = ROOT / "audit_report.md"
 TEMPLATES = ROOT / "templates"
 GENERATED = [NGINX_CONF, COMPOSE_FILE]
 
@@ -25,6 +31,8 @@ REQUIRED_FIELDS = (
     ("nginx", "port"),
     ("network", "name"),
     ("network", "driver_type"),
+    ("opa", "image"),
+    ("opa", "port"),
 )
 
 
@@ -45,7 +53,10 @@ def parse_scalar(value):
     try:
         return int(value)
     except ValueError:
-        return value
+        try:
+            return float(value)
+        except ValueError:
+            return value
 
 
 def load_manifest():
@@ -90,7 +101,7 @@ def load_manifest():
 def quote_yaml(value):
     if isinstance(value, bool):
         return "true" if value else "false"
-    if isinstance(value, int):
+    if isinstance(value, (int, float)):
         return str(value)
     text = str(value)
     if text == "" or any(char in text for char in ":#{}[]&,") or text.lower() in {"true", "false"}:
@@ -99,7 +110,14 @@ def quote_yaml(value):
 
 
 def write_manifest(data):
-    order = ("services", "nginx", "network")
+    order = (
+        "services",
+        "nginx",
+        "network",
+        "opa",
+        "policy_infrastructure",
+        "policy_canary",
+    )
     lines = []
     for section in order:
         values = data.get(section, {})
@@ -125,6 +143,7 @@ def manifest_context(data):
     service = data["services"]
     nginx = data["nginx"]
     network = data["network"]
+    opa = data["opa"]
     return {
         "service_image": str(service["image"]),
         "service_port": str(service["port"]),
@@ -137,6 +156,8 @@ def manifest_context(data):
         "contact": str(nginx.get("contact", "ops@swiftdeploy.local")),
         "network_name": str(network["name"]),
         "network_driver": str(network["driver_type"]),
+        "opa_image": str(opa["image"]),
+        "opa_port": str(opa["port"]),
     }
 
 
@@ -150,10 +171,17 @@ def render_template(name, context):
 def init(_args):
     data = load_manifest()
     context = manifest_context(data)
+    POLICIES_DIR.mkdir(exist_ok=True)
     NGINX_CONF.write_text(render_template("nginx.conf.tpl", context))
     COMPOSE_FILE.write_text(render_template("docker-compose.yml.tpl", context))
+    (POLICIES_DIR / "infrastructure.rego").write_text(
+        render_template("infrastructure.rego.tpl", context)
+    )
+    (POLICIES_DIR / "canary.rego").write_text(render_template("canary.rego.tpl", context))
     print(f"generated {NGINX_CONF.name}")
     print(f"generated {COMPOSE_FILE.name}")
+    print(f"generated {POLICIES_DIR.name}/infrastructure.rego")
+    print(f"generated {POLICIES_DIR.name}/canary.rego")
 
 
 def run(command, *, check=True, capture=True):
@@ -255,6 +283,333 @@ def health_url(data):
     return f"http://127.0.0.1:{data['nginx']['port']}/healthz"
 
 
+def metrics_url(data):
+    return f"http://127.0.0.1:{data['nginx']['port']}/metrics"
+
+
+def opa_url(data, path):
+    return f"http://127.0.0.1:{data['opa']['port']}{path}"
+
+
+def post_json(url, payload, *, timeout=3):
+    body = json.dumps({"input": payload}).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return response.status, json.loads(response.read().decode("utf-8"))
+
+
+def wait_for_opa(data, timeout=20):
+    deadline = time.time() + timeout
+    last_error = None
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(opa_url(data, "/health"), timeout=2) as response:
+                if response.status == 200:
+                    return
+                last_error = f"OPA health returned HTTP {response.status}"
+        except (urllib.error.URLError, TimeoutError) as exc:
+            last_error = str(exc)
+        time.sleep(1)
+    raise SwiftDeployError(f"OPA did not become available within {timeout}s: {last_error}")
+
+
+def ensure_opa(data):
+    init(argparse.Namespace())
+    run(["docker", "compose", "up", "-d", "opa"], capture=False)
+    wait_for_opa(data)
+
+
+def memory_stats():
+    try:
+        values = {}
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            key, raw_value = line.split(":", 1)
+            values[key] = float(raw_value.strip().split()[0]) / 1024 / 1024
+        total = values.get("MemTotal", 0.0)
+        available = values.get("MemAvailable", 0.0)
+        return {
+            "total_gb": round(total, 3),
+            "available_gb": round(available, 3),
+            "used_percent": round(((total - available) / total) * 100, 3) if total else 0,
+        }
+    except (OSError, ValueError):
+        return {"total_gb": 0, "available_gb": 0, "used_percent": 0}
+
+
+def host_stats():
+    disk = shutil.disk_usage(ROOT)
+    try:
+        cpu_load = os.getloadavg()[0]
+    except (AttributeError, OSError):
+        cpu_load = 0.0
+    return {
+        "disk_free_gb": round(disk.free / (1024 ** 3), 3),
+        "disk_total_gb": round(disk.total / (1024 ** 3), 3),
+        "cpu_load": round(cpu_load, 3),
+        "memory": memory_stats(),
+    }
+
+
+def policy_limits(data):
+    infra = data.get("policy_infrastructure", {})
+    canary = data.get("policy_canary", {})
+    return {
+        "infrastructure": {
+            "min_disk_free_gb": float(infra.get("min_disk_free_gb", 10)),
+            "max_cpu_load": float(infra.get("max_cpu_load", 2.0)),
+        },
+        "canary": {
+            "max_error_rate": float(canary.get("max_error_rate", 0.01)),
+            "max_p99_latency_ms": float(canary.get("max_p99_latency_ms", 500)),
+            "window_seconds": int(canary.get("window_seconds", 30)),
+        },
+    }
+
+
+def opa_failure(domain, question, message):
+    return {
+        "allowed": False,
+        "domain": domain,
+        "question": question,
+        "reason": message,
+        "violations": [message],
+        "failure": True,
+    }
+
+
+def query_policy(data, domain, question, payload, result_name):
+    url = opa_url(data, f"/v1/data/swiftdeploy/{domain}/{result_name}")
+    try:
+        status, body = post_json(url, payload, timeout=4)
+    except urllib.error.HTTPError as exc:
+        return opa_failure(domain, question, f"OPA returned HTTP {exc.code} for {domain}")
+    except urllib.error.URLError as exc:
+        reason = getattr(exc, "reason", exc)
+        if isinstance(reason, ConnectionRefusedError):
+            return opa_failure(domain, question, "OPA is not accepting connections")
+        if isinstance(reason, TimeoutError):
+            return opa_failure(domain, question, "OPA request timed out")
+        return opa_failure(domain, question, f"OPA connection failed: {reason}")
+    except TimeoutError:
+        return opa_failure(domain, question, "OPA request timed out")
+    except json.JSONDecodeError:
+        return opa_failure(domain, question, "OPA returned invalid JSON")
+
+    if status != 200:
+        return opa_failure(domain, question, f"OPA returned unexpected HTTP {status}")
+    decision = body.get("result")
+    if not isinstance(decision, dict):
+        return opa_failure(domain, question, f"OPA did not return a decision for {domain}")
+    if not isinstance(decision.get("allowed"), bool):
+        return opa_failure(domain, question, f"OPA decision for {domain} is missing allowed=true/false")
+    if not decision.get("reason"):
+        decision["reason"] = "policy passed" if decision["allowed"] else "policy blocked without a reason"
+    decision.setdefault("violations", [])
+    decision.setdefault("domain", domain)
+    decision.setdefault("question", question)
+    return decision
+
+
+def print_policy_results(title, decisions):
+    print(title)
+    for decision in decisions:
+        status = "ALLOW" if decision.get("allowed") else "BLOCK"
+        print(f"  [{status}] {decision.get('domain')}: {decision.get('reason')}")
+        for violation in decision.get("violations", []):
+            print(f"    - {violation}")
+
+
+def enforce_policy(title, decisions):
+    print_policy_results(title, decisions)
+    blocked = [decision for decision in decisions if not decision.get("allowed")]
+    if blocked:
+        raise SwiftDeployError(f"policy gate blocked {len(blocked)} signal(s)")
+
+
+def pre_deploy_decisions(data):
+    limits = policy_limits(data)
+    payload = {
+        "question": "pre-deploy",
+        "stats": host_stats(),
+        "limits": limits["infrastructure"],
+    }
+    return [
+        query_policy(
+            data,
+            "infrastructure",
+            "pre-deploy",
+            payload,
+            "deploy_decision",
+        )
+    ]
+
+
+METRIC_RE = re.compile(r"^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{([^}]*)\})?\s+([-+0-9.eE]+)$")
+
+
+def parse_labels(text):
+    labels = {}
+    if not text:
+        return labels
+    for item in re.finditer(r'([a-zA-Z_][a-zA-Z0-9_]*)="([^"]*)"', text):
+        labels[item.group(1)] = item.group(2)
+    return labels
+
+
+def parse_metrics(text):
+    series = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        match = METRIC_RE.match(line)
+        if not match:
+            continue
+        series.append(
+            {
+                "name": match.group(1),
+                "labels": parse_labels(match.group(2)),
+                "value": float(match.group(3)),
+            }
+        )
+    return series
+
+
+def scrape_metrics(data):
+    try:
+        with urllib.request.urlopen(metrics_url(data), timeout=4) as response:
+            text = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        raise SwiftDeployError(f"metrics endpoint returned HTTP {exc.code}") from exc
+    except urllib.error.URLError as exc:
+        raise SwiftDeployError(f"metrics endpoint is unreachable: {exc}") from exc
+    except TimeoutError as exc:
+        raise SwiftDeployError("metrics scrape timed out") from exc
+    return parse_metrics(text)
+
+
+def metric_value(series, name, labels=None, default=0.0):
+    labels = labels or {}
+    total = 0.0
+    found = False
+    for sample in series:
+        if sample["name"] != name:
+            continue
+        if all(sample["labels"].get(key) == value for key, value in labels.items()):
+            total += sample["value"]
+            found = True
+    return total if found else default
+
+
+def summarize_metrics(series, previous=None, elapsed=None):
+    total_requests = metric_value(series, "http_requests_total")
+    error_requests = 0.0
+    for sample in series:
+        if sample["name"] == "http_requests_total":
+            status = sample["labels"].get("status_code", "")
+            if status.startswith("5"):
+                error_requests += sample["value"]
+
+    buckets = {}
+    for sample in series:
+        if sample["name"] != "http_request_duration_seconds_bucket":
+            continue
+        le = sample["labels"].get("le")
+        if le == "+Inf":
+            key = float("inf")
+        else:
+            key = float(le)
+        buckets[key] = buckets.get(key, 0.0) + sample["value"]
+    p99 = histogram_quantile(0.99, buckets) * 1000 if buckets else 0.0
+
+    req_per_second = 0.0
+    error_rate = (error_requests / total_requests) if total_requests else 0.0
+    if previous and elapsed and elapsed > 0:
+        req_delta = max(0.0, total_requests - previous.get("total_requests", 0.0))
+        err_delta = max(0.0, error_requests - previous.get("error_requests", 0.0))
+        req_per_second = req_delta / elapsed
+        error_rate = (err_delta / req_delta) if req_delta else 0.0
+
+    return {
+        "total_requests": total_requests,
+        "error_requests": error_requests,
+        "req_per_second": req_per_second,
+        "error_rate": error_rate,
+        "p99_latency_ms": p99,
+        "app_uptime_seconds": metric_value(series, "app_uptime_seconds"),
+        "app_mode": int(metric_value(series, "app_mode")),
+        "chaos_active": int(metric_value(series, "chaos_active")),
+    }
+
+
+def histogram_quantile(quantile, buckets):
+    if not buckets:
+        return 0.0
+    total = buckets.get(float("inf"), max(buckets.values()))
+    if total <= 0:
+        return 0.0
+    rank = quantile * total
+    previous_le = 0.0
+    previous_count = 0.0
+    for le in sorted(bucket for bucket in buckets if bucket != float("inf")):
+        count = buckets[le]
+        if count >= rank:
+            bucket_count = count - previous_count
+            if bucket_count <= 0:
+                return le
+            position = (rank - previous_count) / bucket_count
+            return previous_le + (le - previous_le) * position
+        previous_le = le
+        previous_count = count
+    return max(bucket for bucket in buckets if bucket != float("inf"))
+
+
+def canary_metrics_for_policy(data):
+    series = scrape_metrics(data)
+    summary = summarize_metrics(series)
+    limits = policy_limits(data)
+    return {
+        "question": "pre-promote",
+        "metrics": {
+            "error_rate": summary["error_rate"],
+            "p99_latency_ms": summary["p99_latency_ms"],
+            "window_seconds": limits["canary"]["window_seconds"],
+        },
+        "limits": limits["canary"],
+    }, summary
+
+
+def pre_promote_decisions(data):
+    payload, _summary = canary_metrics_for_policy(data)
+    return [
+        query_policy(
+            data,
+            "canary",
+            "pre-promote",
+            payload,
+            "promotion_decision",
+        )
+    ]
+
+
+def append_history(entry):
+    with HISTORY_FILE.open("a") as handle:
+        handle.write(json.dumps(entry, sort_keys=True) + "\n")
+
+
+def mode_name(value):
+    return "canary" if int(value) == 1 else "stable"
+
+
+def chaos_name(value):
+    return {0: "none", 1: "slow", 2: "error"}.get(int(value), "unknown")
+
+
 def wait_for_health(data, expected_mode=None, timeout=60):
     deadline = time.time() + timeout
     url = health_url(data)
@@ -274,9 +629,10 @@ def wait_for_health(data, expected_mode=None, timeout=60):
 
 
 def deploy(args):
-    init(args)
-    run(["docker", "compose", "up", "-d"], capture=False)
     data = load_manifest()
+    ensure_opa(data)
+    enforce_policy("pre-deploy policy gate:", pre_deploy_decisions(data))
+    run(["docker", "compose", "up", "-d"], capture=False)
     payload = wait_for_health(data, timeout=60)
     print(f"deployment healthy: {json.dumps(payload, separators=(',', ':'))}")
 
@@ -284,6 +640,8 @@ def deploy(args):
 def promote(args):
     target = args.mode
     data = load_manifest()
+    ensure_opa(data)
+    enforce_policy("pre-promote policy gate:", pre_promote_decisions(data))
     current = str(data.get("services", {}).get("mode", "stable"))
     if current == target:
         print(f"service already in {target} mode")
@@ -295,6 +653,174 @@ def promote(args):
     print(f"promoted to {target}: {json.dumps(payload, separators=(',', ':'))}")
 
 
+def status(args):
+    data = load_manifest()
+    previous = None
+    previous_time = None
+    while True:
+        scraped_at = datetime.now(timezone.utc).isoformat()
+        series = scrape_metrics(data)
+        now = time.time()
+        elapsed = now - previous_time if previous_time else None
+        summary = summarize_metrics(series, previous, elapsed)
+
+        infra_decisions = pre_deploy_decisions(data)
+        limits = policy_limits(data)
+        canary_payload = {
+            "question": "pre-promote",
+            "metrics": {
+                "error_rate": summary["error_rate"],
+                "p99_latency_ms": summary["p99_latency_ms"],
+                "window_seconds": limits["canary"]["window_seconds"],
+            },
+            "limits": limits["canary"],
+        }
+        canary_decisions = [
+            query_policy(
+                data,
+                "canary",
+                "pre-promote",
+                canary_payload,
+                "promotion_decision",
+            )
+        ]
+        decisions = infra_decisions + canary_decisions
+
+        print("\033[2J\033[H", end="")
+        print("swiftdeploy status")
+        print(f"scraped_at: {scraped_at}")
+        print(f"mode: {mode_name(summary['app_mode'])}")
+        print(f"chaos: {chaos_name(summary['chaos_active'])}")
+        print(f"req/s: {summary['req_per_second']:.2f}")
+        print(f"p99 latency: {summary['p99_latency_ms']:.2f}ms")
+        print(f"error rate: {summary['error_rate'] * 100:.2f}%")
+        print(f"uptime: {summary['app_uptime_seconds']:.1f}s")
+        print("\nPolicy Compliance")
+        for decision in decisions:
+            marker = "PASS" if decision.get("allowed") else "FAIL"
+            print(f"- [{marker}] {decision.get('domain')}: {decision.get('reason')}")
+
+        append_history(
+            {
+                "timestamp": scraped_at,
+                "type": "scrape",
+                "metrics": summary,
+                "policies": decisions,
+            }
+        )
+
+        previous = summary
+        previous_time = now
+        if args.once:
+            return 0
+        time.sleep(args.interval)
+
+
+def load_history():
+    if not HISTORY_FILE.exists():
+        return []
+    entries = []
+    for line_number, line in enumerate(HISTORY_FILE.read_text().splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            entries.append(json.loads(line))
+        except json.JSONDecodeError as exc:
+            raise SwiftDeployError(f"invalid history.jsonl near line {line_number}") from exc
+    return entries
+
+
+def markdown_table(headers, rows):
+    output = [
+        "| " + " | ".join(headers) + " |",
+        "| " + " | ".join("---" for _ in headers) + " |",
+    ]
+    for row in rows:
+        output.append("| " + " | ".join(str(cell).replace("\n", " ") for cell in row) + " |")
+    return "\n".join(output)
+
+
+def audit(_args):
+    entries = load_history()
+    lines = [
+        "# SwiftDeploy Audit Report",
+        "",
+        f"Generated: {datetime.now(timezone.utc).isoformat()}",
+        "",
+        "## Timeline",
+        "",
+    ]
+
+    timeline = []
+    previous_mode = None
+    previous_chaos = None
+    for entry in entries:
+        metrics = entry.get("metrics", {})
+        mode = mode_name(metrics.get("app_mode", 0))
+        chaos = chaos_name(metrics.get("chaos_active", 0))
+        changes = []
+        if previous_mode is None or previous_mode != mode:
+            changes.append(f"mode changed to {mode}")
+        if previous_chaos is None or previous_chaos != chaos:
+            changes.append(f"chaos changed to {chaos}")
+        if changes:
+            timeline.append([entry.get("timestamp", ""), mode, chaos, "; ".join(changes)])
+        previous_mode = mode
+        previous_chaos = chaos
+
+    if timeline:
+        lines.append(markdown_table(["Timestamp", "Mode", "Chaos", "Event"], timeline))
+    else:
+        lines.append("_No mode or chaos changes recorded._")
+
+    lines.extend(["", "## Violations", ""])
+    violations = []
+    for entry in entries:
+        for decision in entry.get("policies", []):
+            if decision.get("allowed"):
+                continue
+            reason = decision.get("reason", "")
+            violations.append(
+                [
+                    entry.get("timestamp", ""),
+                    decision.get("domain", ""),
+                    decision.get("question", ""),
+                    reason,
+                ]
+            )
+    if violations:
+        lines.append(markdown_table(["Timestamp", "Domain", "Question", "Reason"], violations))
+    else:
+        lines.append("_No policy violations recorded._")
+
+    lines.extend(["", "## Scrape Summary", ""])
+    summary_rows = []
+    for entry in entries:
+        metrics = entry.get("metrics", {})
+        summary_rows.append(
+            [
+                entry.get("timestamp", ""),
+                mode_name(metrics.get("app_mode", 0)),
+                chaos_name(metrics.get("chaos_active", 0)),
+                f"{float(metrics.get('req_per_second', 0.0)):.2f}",
+                f"{float(metrics.get('p99_latency_ms', 0.0)):.2f}ms",
+                f"{float(metrics.get('error_rate', 0.0)) * 100:.2f}%",
+            ]
+        )
+    if summary_rows:
+        lines.append(
+            markdown_table(
+                ["Timestamp", "Mode", "Chaos", "Req/s", "P99 Latency", "Error Rate"],
+                summary_rows,
+            )
+        )
+    else:
+        lines.append("_No scrapes recorded._")
+
+    AUDIT_REPORT.write_text("\n".join(lines) + "\n")
+    print(f"generated {AUDIT_REPORT.name}")
+
+
 def teardown(args):
     command = ["docker", "compose", "down", "--volumes", "--remove-orphans"]
     run(command, capture=False)
@@ -303,6 +829,9 @@ def teardown(args):
             if path.exists():
                 path.unlink()
                 print(f"deleted {path.name}")
+        if POLICIES_DIR.exists():
+            shutil.rmtree(POLICIES_DIR)
+            print(f"deleted {POLICIES_DIR.name}")
 
 
 def build_parser():
@@ -321,6 +850,14 @@ def build_parser():
     promote_parser = subcommands.add_parser("promote", help="switch between stable and canary")
     promote_parser.add_argument("mode", choices=("canary", "stable"))
     promote_parser.set_defaults(func=promote)
+
+    status_parser = subcommands.add_parser("status", help="live metrics and policy dashboard")
+    status_parser.add_argument("--interval", type=float, default=2.0, help="refresh interval in seconds")
+    status_parser.add_argument("--once", action="store_true", help="scrape once and exit")
+    status_parser.set_defaults(func=status)
+
+    audit_parser = subcommands.add_parser("audit", help="generate audit_report.md from history.jsonl")
+    audit_parser.set_defaults(func=audit)
 
     teardown_parser = subcommands.add_parser("teardown", help="remove stack resources")
     teardown_parser.add_argument("--clean", action="store_true", help="delete generated configs")
