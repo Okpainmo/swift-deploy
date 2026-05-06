@@ -14,3 +14,16 @@ nginx:
 network:
   name: swiftdeploy-net
   driver_type: bridge
+
+opa:
+  image: "openpolicyagent/opa:latest"
+  port: 8181
+
+policy_infrastructure:
+  min_disk_free_gb: 10
+  max_cpu_load: 2.0
+
+policy_canary:
+  max_error_rate: 0.01
+  max_p99_latency_ms: 500
+  window_seconds: 30
