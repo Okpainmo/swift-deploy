@@ -49,6 +49,22 @@ services:
       - swiftdeploy
     restart: ${restart_policy}
 
+  opa:
+    image: ${opa_image}
+    container_name: swiftdeploy-opa
+    command:
+      - run
+      - --server
+      - --addr=0.0.0.0:8181
+      - /policies
+    ports:
+      - "127.0.0.1:${opa_port}:8181"
+    volumes:
+      - ./policies:/policies:ro
+    networks:
+      - swiftdeploy
+    restart: ${restart_policy}
+
 networks:
   swiftdeploy:
     name: ${network_name}
