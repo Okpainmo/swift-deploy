@@ -20,6 +20,7 @@ app/main.py                    # API service
 app/requirements.txt           # FastAPI runtime dependencies
 templates/nginx.conf.tpl       # Nginx config template
 templates/docker-compose.yml.tpl # Docker Compose template
+templates/*.rego.tpl           # OPA policy templates generated into policies/
 ```
 
 ## Requirements
@@ -41,6 +42,10 @@ Generate the config files:
 ```bash
 ./swiftdeploy init
 ```
+
+`init` also generates `policies/infrastructure.rego` and
+`policies/canary.rego`. Policy thresholds live in `manifest.yaml`; the Rego files
+contain only decision logic.
 
 Run the five pre-flight checks:
 
@@ -64,6 +69,10 @@ Run the five pre-flight checks:
 
 `deploy` runs `init`, starts the stack with `docker compose up -d`, then waits up
 to 60 seconds for `/healthz` to pass through Nginx.
+
+Before the public stack is deployed, `swiftdeploy` starts the local OPA sidecar
+and asks the infrastructure policy whether the host is safe. The CLI surfaces the
+OPA reason and blocks on violations such as low disk space or high CPU load.
 
 Test the service:
 
@@ -114,6 +123,33 @@ curl http://127.0.0.1:8080/healthz
 
 `promote` updates `manifest.yaml`, regenerates `docker-compose.yml`, restarts
 only the app container, and confirms the active mode through `/healthz`.
+
+Before promotion, `swiftdeploy` scrapes `/metrics`, calculates error rate and P99
+latency, asks OPA's canary policy for a reasoned decision, and blocks unhealthy
+canaries.
+
+## Metrics, Status, and Audit
+
+The API exposes Prometheus text metrics at:
+
+```bash
+curl http://127.0.0.1:8080/metrics
+```
+
+Run the live dashboard:
+
+```bash
+./swiftdeploy status
+```
+
+Each scrape is appended to `history.jsonl`. Generate the Markdown audit report:
+
+```bash
+./swiftdeploy audit
+```
+
+OPA is reachable by the CLI at the loopback-bound manifest port, for example
+`127.0.0.1:8181`, and is not routed through the public Nginx ingress.
 
 ## Logs
 
