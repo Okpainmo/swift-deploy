@@ -1,13 +1,50 @@
 # Swift Deploy
 
-> A lightweight, declarative infrastructure tool that turns a single manifest.yaml into a fully running containerized stack.
+`swiftdeploy` is a declarative deployment orchestration tool that generates and manages an entire containerized application stack from a single `manifest.yaml` source of truth.
 
-`swiftdeploy` is a small declarative deployment tool. You describe the stack once in `manifest.yaml`, then on running the respective CLI commands, it(the CLI) is able to generate `nginx.conf` and `docker-compose.yml` from provided customizable templates, start the respective containers, switch release modes, and also tear the stack down - respectively.
+The project combines infrastructure automation, reverse proxy configuration, observability, policy enforcement, and deployment lifecycle management into a unified CLI-driven platform. Rather than manually writing infrastructure files, operators define the desired deployment state in a manifest, while `swiftdeploy` dynamically generates and manages Docker Compose, Nginx, monitoring, and policy configurations automatically.
 
-The manifest is the source of truth. Generated files can be recreated with:
+The platform supports:
 
-```bash
-./swiftdeploy init
+- Declarative infrastructure generation
+
+- Automated stack deployment and teardown
+
+- Canary and stable deployment modes
+
+- Health checks and chaos testing
+
+- Prometheus-style metrics instrumentation
+
+- Real-time operational status monitoring
+
+- Open Policy Agent (OPA) powered deployment guardrails
+
+- Policy-gated promotions and deployments
+
+- Audit logging and historical reporting
+
+`swiftdeploy` demonstrates modern DevOps and SRE practices including Infrastructure as Code (IaC), Policy-as-Code, observability, progressive delivery, and operational auditing within a lightweight self-managed platform.
+
+## Overall Architecture
+
+```text
+manifest.yaml
+      ↓
+swiftdeploy
+      ↓
+generated infrastructure
+      ↓
+Docker Compose
+ ├── App
+ ├── Nginx
+ └── OPA
+      ↓
+Metrics + Policies
+      ↓
+Safe deployment decisions
+      ↓
+Audit history
 ```
 
 ## Project Layout
@@ -47,7 +84,7 @@ Generate the config files:
 `policies/canary.rego`. Policy thresholds live in `manifest.yaml`; the Rego files
 contain only decision logic.
 
-Run the five pre-flight checks:
+Run the local pre-flight checks:
 
 ```bash
 ./swiftdeploy validate
@@ -61,18 +98,22 @@ Run the five pre-flight checks:
 - the configured Nginx host port is free
 - generated `nginx.conf` passes `nginx -t`
 
+`deploy` goes further than validation: it starts OPA, sends live host stats to the
+infrastructure policy, blocks unsafe deploys, starts the public stack, and waits
+for `/healthz` to pass through Nginx.
+
 ## Deploy
 
 ```bash
 ./swiftdeploy deploy
 ```
 
-`deploy` runs `init`, starts the stack with `docker compose up -d`, then waits up
-to 60 seconds for `/healthz` to pass through Nginx.
+`deploy` runs `init`, starts the OPA policy sidecar, asks the infrastructure
+policy whether the host is safe, starts the stack with `docker compose up -d`,
+then waits up to 60 seconds for `/healthz` to pass through Nginx.
 
-Before the public stack is deployed, `swiftdeploy` starts the local OPA sidecar
-and asks the infrastructure policy whether the host is safe. The CLI surfaces the
-OPA reason and blocks on violations such as low disk space or high CPU load.
+The CLI surfaces the OPA reason and blocks on violations such as low disk space
+or high CPU load.
 
 Test the service:
 
@@ -184,31 +225,54 @@ Remove generated configs too:
 
 ## Manifest
 
-Base required fields(image names and port are alterable):
+Example manifest:
 
 ```yaml
 services:
-  image: swift-deploy-1-node:latest
-  port: 3000
+  image: 'sd-demo-api-1:latest'
+  port: 5000
+  mode: stable
+  version: 1.0.0
+  restart_policy: unless-stopped
 
 nginx:
-  image: nginx:latest
+  image: 'nginx:latest'
   port: 8080
+  proxy_timeout: 5s
+  contact: ops@swiftdeploy.local
 
 network:
   name: swiftdeploy-net
   driver_type: bridge
+
+opa:
+  image: 'openpolicyagent/opa:latest'
+  port: 8181
+
+policy_infrastructure:
+  min_disk_free_gb: 10
+  max_cpu_load: 2.0
+
+policy_canary:
+  max_error_rate: 0.01
+  max_p99_latency_ms: 500
+  window_seconds: 30
 ```
 
-## Practical Use Cases.
+`services`, `nginx`, `network`, and `opa` define the generated runtime stack.
+`policy_infrastructure` controls the pre-deploy gate. `policy_canary` controls
+the promotion gate that evaluates error rate and P99 latency from `/metrics`.
+
+## Practical Use Cases
 
 At its heart, SwiftDeploy is:
 
-> **A declarative → generated → reproducible deployment system**
+> **A declarative -> generated -> policy-gated -> observable deployment loop**
 
-That pattern shows up everywhere - from **Terraform** to internal platform tools at big companies.
+That pattern shows up everywhere from Terraform and Helm to internal platform
+tools that standardize how teams ship software.
 
-### 1. Ephemeral Dev Environments(Per Feature Branch)
+### 1. Ephemeral Dev Environments
 
 #### Problem
 
@@ -222,8 +286,7 @@ Each developer writes:
 services:
   image: myapp:feature-xyz
   port: 3000
-
-mode: canary
+  mode: stable
 ```
 
 Then runs:
@@ -238,9 +301,9 @@ Then runs:
 
 #### Result
 
-* Spin up **isolated environments instantly**
-* No manual Nginx/Docker setup
-* Easy teardown after testing
+- Spin up isolated environments quickly
+- Avoid manual Nginx and Docker networking setup
+- Tear everything down after testing
 
 This is how companies simulate **preview environments**.
 
@@ -258,19 +321,17 @@ You want safe rollouts but don’t have Kubernetes.
 
 #### Real usage
 
-* Deploy new version in **canary mode**
-* Introduce failures with `/chaos`
-* Observe logs + behavior
-* Roll back:
+- Promote the app into canary mode
+- Inject slow responses or random failures with `/chaos`
+- Watch metrics, policy status, and Nginx logs
+- Return to stable:
 
 ```bash
 ./swiftdeploy promote stable
 ```
 
-This mimics production patterns used in:
-
-* load balancers
-* service meshes
+This mimics rollout patterns commonly handled by load balancers, service meshes,
+or platform release tooling.
 
 ### 3. Internal Platform Tooling (Platform Engineering)
 
@@ -278,9 +339,9 @@ This mimics production patterns used in:
 
 Teams keep rewriting:
 
-* Docker Compose configs
-* Nginx configs
-* deployment scripts
+- Docker Compose configs
+- Nginx configs
+- deployment scripts
 
 #### SwiftDeploy becomes:
 
@@ -306,10 +367,8 @@ Then:
 ./swiftdeploy deploy
 ```
 
-This is exactly what internal tools at companies replace:
-
-* raw Docker usage
-* inconsistent setups
+SwiftDeploy gives those teams a single command surface instead of raw Docker
+usage, hand-written proxy configs, and inconsistent setup notes.
 
 ### 4. Onboarding New Engineers
 
@@ -329,13 +388,11 @@ git clone repo
 
 Done.
 
-No need to explain:
+No need to explain Nginx configs, container ports, Docker networking, policy
+files, or health checks before someone can see the system running.
 
-* Nginx configs
-* ports
-* Docker networking
-
-This reduces onboarding time drastically.
+This reduces onboarding time and gives new engineers a concrete model of the
+deployment flow.
 
 ### 5. Chaos Testing & Resilience Validation
 
@@ -349,18 +406,17 @@ POST /chaos
 
 Simulate:
 
-* slow services
-* random failures
+- slow services
+- random failures
 
 Test:
 
-* retry logic
-* timeouts
-* monitoring alerts
+- retry logic
+- timeouts
+- monitoring alerts
 
-This is similar to tools like:
-
-* Chaos Monkey(Netflix)
+This is the same family of thinking as resilience tools like Netflix's Chaos
+Monkey, scaled down into a small local demo.
 
 ### 6. Standardized Logging & Observability Entry Point
 
@@ -374,18 +430,18 @@ $time_iso8601 | $status | ${request_time}s | $upstream_addr | $request
 
 In real systems:
 
-* logs are inconsistent
-* debugging is painful
+- logs are inconsistent
+- debugging is painful
 
 SwiftDeploy enforces:
 
-* uniform logs
-* traceable requests
+- uniform logs
+- traceable requests
 
 This becomes the foundation for:
 
-* monitoring pipelines
-* log aggregation (ELK, Loki)
+- monitoring pipelines
+- log aggregation (ELK, Loki)
 
 ### 7. Reproducible Infrastructure (No Config Drift)
 
@@ -401,12 +457,14 @@ manifest.yaml → always regenerates everything
 
 #### Result
 
-* Delete configs → regenerate → same system
-* No “it works on my machine” issues
+- Delete generated configs, regenerate them, and get the same system back
+- Keep the manifest as the reviewable source of truth
+- Reduce "it works on my machine" drift
 
-This is **exactly** why Terraform exists.
+This is the same core reason tools like Terraform and Helm exist: the desired
+state should be declared once and regenerated consistently.
 
-### 8. CI/CD Integration (Next Level)
+### 8. CI/CD Integration
 
 You can plug this into CI:
 
@@ -417,15 +475,17 @@ You can plug this into CI:
 
 #### Use case
 
-* Run integration tests in CI
-* Spin up full stack temporarily
-* Tear it down after
+- Run integration tests in CI
+- Spin up full stack temporarily
+- Tear it down after
 
-Lightweight alternative to full cloud environments.
+It can be a lightweight alternative to full cloud environments for integration
+tests, demos, and policy checks.
 
-### 9. Microservice Sandbox
+### 9. Microservice Sandbox Direction
 
-If you extend your manifest:
+The current manifest models one app behind Nginx, but the same design can grow
+into multi-service orchestration. A future manifest could describe:
 
 ```yaml
 services:
@@ -434,51 +494,55 @@ services:
   - analytics
 ```
 
-You now have:
-
-> A **mini orchestrator for microservices**
+That would turn SwiftDeploy into a mini orchestrator for local microservice
+sandboxes.
 
 Useful for:
 
-* local testing
-* architecture experiments
-* demos
+- local testing
+- architecture experiments
+- demos
 
 ### 10. Foundation for Bigger Tools
 
-SwiftDeploy is basically like a **proto version** of:
+SwiftDeploy is a compact prototype of ideas from:
 
-* Helm(templating configs)
-* Docker Compose(service orchestration)
-* Terraform(declarative infra)
+- Helm for templating runtime config
+- Docker Compose for service orchestration
+- Terraform for declarative infrastructure thinking
+- OPA for policy-as-code gates
+- Prometheus-style metrics for deploy decisions
 
 ## Where this shines (and where it doesn’t)
 
 ### Great for:
 
-* Local environments
-* Small teams
-* Internal tools
-* POCs
-* Learning infra design
+- Local environments
+- Small teams
+- Internal tools
+- POCs
+- Learning infrastructure design
+- Demonstrating policy-gated deployment and canary workflows
 
 ### Not enough for:
 
-* large-scale production
-* auto-scaling
-* distributed systems
-* multi-region deployments
+- large-scale production
+- auto-scaling
+- distributed scheduling
+- multi-region deployments
+- secrets rotation
 
-## Leveling Up.
+## Leveling Up
 
 You might wish to extend SwiftDeploy into a tool for:
 
-* remote deployment (SSH)
-* secrets management
-* multi-service orchestration
-* CI/CD integration
-* monitoring hooks (Prometheus)
+- remote deployment over SSH
+- secrets management
+- multi-service orchestration
+- CI/CD integration
+- Prometheus scraping and alert hooks
+- rollback semantics that bypass unhealthy canary gates
 
-**Contributions and welcomed.**
+**Contributions are welcome.**
 
 Cheers!!!
